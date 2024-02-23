@@ -209,7 +209,8 @@
 -type mod()          :: '_' | module().
 -type fn()           :: '_' | atom().
 -type args()         :: '_' | 0..255 | return_trace | matchspec() | shellfun().
--type tspec()        :: {mod(), fn(), args()}.
+-type tspec()        :: {mod(), fn(), args()}
+                      | {function(), return_trace | matchspec() | shellfun()}.
 -type max()          :: max_traces() | max_rate().
 -type num_matches()  :: non_neg_integer().
 
@@ -232,6 +233,8 @@ clear() ->
 
 %% @equiv calls({Mod, Fun, Args}, Max, [])
 -spec calls(tspec() | [tspec(),...], max()) -> num_matches().
+calls({MFAFn, Args}, Max) ->
+    calls([{MFAFn, Args}], Max);
 calls({Mod, Fun, Args}, Max) ->
     calls([{Mod,Fun,Args}], Max, []);
 calls(TSpecs = [_|_], Max) ->
@@ -334,6 +337,8 @@ calls(TSpecs = [_|_], Max) ->
 %% @end
 -spec calls(tspec() | [tspec(),...], max(), options()) -> num_matches().
 
+calls({MFAFn, Args}, Max, Opts) ->
+    calls([{MFAFn, Args}], Max, Opts);
 calls({Mod, Fun, Args}, Max, Opts) ->
     calls([{Mod,Fun,Args}], Max, Opts);
 calls(TSpecs = [_|_], {Max, Time}, Opts) ->
@@ -424,9 +429,9 @@ setup(TracerFun, TracerArgs, FormatterFun, IOServer) ->
 trace_calls(TSpecs, Pid, Opts) ->
     {PidSpecs, TraceOpts, MatchOpts} = validate_opts(Opts),
     Matches = [begin
-                {Arity, Spec} = validate_tspec(Mod, Fun, Args),
+                {Mod, Fun, Arity, Spec} = validate_tspec(TSpec),
                 erlang:trace_pattern({Mod, Fun, Arity}, Spec, MatchOpts)
-               end || {Mod, Fun, Args} <- TSpecs],
+               end || TSpec <- TSpecs],
     [erlang:trace(PidSpec, true, [call, {tracer, Pid} | TraceOpts])
      || PidSpec <- PidSpecs],
     lists:sum(Matches).
@@ -480,25 +485,31 @@ validate_pid_specs(PidTerm) ->
     %% has to be `recon:pid_term()'.
     [recon_lib:term_to_pid(PidTerm)].
 
-validate_tspec(Mod, Fun, Args) when is_function(Args) ->
-    validate_tspec(Mod, Fun, fun_to_ms(Args));
+validate_tspec(Mod, Fun, Arity, MSFun) when is_function(MSFun) ->
+    validate_tspec(Mod, Fun, Arity, fun_to_ms(MSFun));
 %% helper to save typing for common actions
-validate_tspec(Mod, Fun, return_trace) ->
-    validate_tspec(Mod, Fun, [{'_', [], [{return_trace}]}]);
-validate_tspec(Mod, Fun, Args) ->
+validate_tspec(Mod, Fun, Arity, return_trace) ->
+    validate_tspec(Mod, Fun, Arity, [{'_', [], [{return_trace}]}]);
+validate_tspec(Mod, Fun, Arity, Args) when Arity >= 0, Arity =< 255,
+                                           (is_list(Args) orelse Args == true) ->
     BannedMods = ['_', ?MODULE, io, lists],
     %% The banned mod check can be bypassed by using
     %% match specs if you really feel like being dumb.
-    case {lists:member(Mod, BannedMods), Args} of
-        {true, '_'} -> error({dangerous_combo, {Mod,Fun,Args}});
-        {true, []} -> error({dangerous_combo, {Mod,Fun,Args}});
+    case lists:member(Mod, BannedMods) of
+        true when Arity == '_' -> error({dangerous_combo, {Mod, Fun, '_'}});
+        true when Args == [] -> error({dangerous_combo, {Mod, Fun, []}});
         _ -> ok
     end,
-    case Args of
-        '_' -> {'_', true};
-        _ when is_list(Args) -> {'_', Args};
-        _ when Args >= 0, Args =< 255 -> {Args, true}
-    end.
+    {Mod, Fun, Arity, Args}.
+
+validate_tspec({Mod, Fun, Arity}) when is_integer(Arity);
+                                       Arity == '_' ->
+    validate_tspec(Mod, Fun, Arity, true);
+validate_tspec({Mod, Fun, MS}) ->
+    validate_tspec(Mod, Fun, '_', MS);
+validate_tspec({MFAFn, MS}) ->
+    {Mod, Fun, Arity} = fun_to_mfa(MFAFn),
+    validate_tspec(Mod, Fun, Arity, MS).
 
 validate_formatter(Opts) ->
     case proplists:get_value(formatter, Opts) of
@@ -724,6 +735,17 @@ fun_to_ms(ShellFun) when is_function(ShellFun) ->
             exit(shell_funs_only)
     end.
 
+fun_to_mfa(Fn) ->
+    Info = erlang:fun_info(Fn),
+    case proplists:get_value(type, Info) of
+        external ->
+            Mod = proplists:get_value(module, Info),
+            Fun = proplists:get_value(name, Info),
+            Arity = proplists:get_value(arity, Info),
+            {Mod, Fun, Arity};
+        _ ->
+            exit(external_funs_only)
+    end.
 
 -ifdef(OTP_RELEASE).
 -spec join(term(), [term()]) -> [term()].
